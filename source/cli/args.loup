@@ -1,98 +1,127 @@
 @mode(host.dual)
 
-# Command-line parsing. Loup 1.26 has no CLI library, so arguments are
-# parsed by hand into an Options value.
+# Command-line parsing for where, following the Windows switch convention in
+# win/switches.loup:
 #
-# Grammar: [OPTIONS] COMMAND [OPERANDS...]
-#   Options may appear anywhere before `--`; everything after `--` is an
-#   operand. Value options accept `--name VALUE` and `--name=VALUE`.
+#   WHERE [/R dir] [/Q] [/F] [/T] pattern...
+#
+# Switches are case-insensitive and start with `/` or `-`; `--` ends switch
+# parsing. Error messages use the wording of where.exe's command-line
+# parser, followed by `Type "WHERE /?" for usage.`
 
-pub const DEFAULT_GREETING: string = "Hello";
+from win.switches import (SwitchArgs, SwitchSpec, flag, required_value, parse_switches,
+    switch_value);
+
+pub const MSG_TYPE_HELP: string = "Type \"WHERE /?\" for usage.";
 
 pub struct Options {
-    pub command: string;
-    pub operands: list[string];
     pub help: bool;
     pub version: bool;
-    pub verbose: bool;
-    pub shout: bool;
-    pub greeting: string;
+    pub recurse: bool;         # /R given
+    pub root: string;          # the /R directory as typed
+    pub quiet: bool;           # /Q
+    pub quote: bool;           # /F
+    pub patterns: list[string];
 }
 
+pub func where_switches(): list[SwitchSpec] {
+    return [required_value("R"), flag("Q"), flag("F"), flag("T")];
+}
+
+# A usage error: the message and the line that points to the help.
+pub func usage_error(message: string): string {
+    return "ERROR: " + message + "\n" + MSG_TYPE_HELP;
+}
+
+# Whether an argument looks like an option: `/x` or `-x`, and not a
+# `path:pattern` (`/usr/bin:ls`).
+func looks_like_option(arg: string): bool {
+    return arg.len() >= 2 and (arg.startsWith("/") or arg.startsWith("-")) and arg.index_of(":") < 0;
+}
+
+# The arguments before the first `--`.
+func before_double_dash(argv: list[string]): list[string] {
+    var out: list[string] = [];
+    for (a in argv) {
+        if (a == "--") {
+            break;
+        }
+        out.push(a);
+    }
+    return out;
+}
+
+# The first switch given more than once, as typed, or "".
+func repeated_switch(parsed: SwitchArgs): string {
+    var seen: list[string] = [];
+    for (sw in parsed.switches) {
+        if (seen.contains(sw.name)) {
+            return sw.text;
+        }
+        seen.push(sw.name);
+    }
+    return "";
+}
+
+# The statement form of `match` (arms that return) is deliberate: a match
+# expression whose arms build new values returns freed memory natively.
 pub func parse_args(argv: list[string]): Result[Options, string] {
-    var command = "";
-    var operands: list[string] = [];
-    var help = false;
-    var version = false;
-    var verbose = false;
-    var shout = false;
-    var greeting = DEFAULT_GREETING;
-    var only_operands = false;
-
-    var i = 0;
-    while (i < argv.len()) {
-        let arg = argv[i];
-        i += 1;
-
-        if (only_operands or arg == "-" or !arg.startsWith("-")) {
-            if (command.is_empty()) {
-                command = arg;
-            } else {
-                operands.push(arg);
-            }
-            continue;
-        }
-        if (arg == "--") {
-            only_operands = true;
-            continue;
-        }
-
-        # Split `--name=value` into its name and inline value.
-        var name = arg;
-        var inline_value: Option[string] = None;
-        if (arg.startsWith("--") and arg.contains("=")) {
-            let parts = arg.split("=");
-            name = parts[0];
-            inline_value = Some(parts.slice(1).join("="));
-        }
-
-        if (name == "-g" or name == "--greeting") {
-            match inline_value {
-                Some(v) => { greeting = v; },
-                None => {
-                    if (i >= argv.len()) {
-                        return Err(i"option '{$ name $}' requires a value");
-                    }
-                    greeting = argv[i];
-                    i += 1;
-                },
-            }
-            continue;
-        }
-
-        if (inline_value.is_some()) {
-            return Err(i"option '{$ name $}' does not take a value");
-        }
-        if (name == "-h" or name == "--help") {
-            help = true;
-        } else if (name == "-V" or name == "--version") {
-            version = true;
-        } else if (name == "-v" or name == "--verbose") {
-            verbose = true;
-        } else if (name == "--shout") {
-            shout = true;
-        } else {
-            return Err(i"unknown option '{$ name $}'");
-        }
+    let parsed = match parse_switches(argv, where_switches()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(usage_error("Invalid syntax. Value expected for '" + e.text + "'."));
+        },
+    };
+    if (parsed.help or parsed.version) {
+        return Ok(Options(help = parsed.help, version = parsed.version, recurse = false,
+            root = "", quiet = false, quote = false, patterns = parsed.operands));
     }
 
+    # Before `--`, an argument that looks like an option but is not one of
+    # where's is an error, as in where.exe.
+    let early = match parse_switches(before_double_dash(argv), where_switches()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(usage_error("Invalid syntax. Value expected for '" + e.text + "'."));
+        },
+    };
+    for (op in early.operands) {
+        if (looks_like_option(op)) {
+            return Err(usage_error("Invalid argument/option - '" + op + "'."));
+        }
+    }
+    let twice = repeated_switch(parsed);
+    if (twice.len() > 0) {
+        return Err(usage_error("Invalid syntax. '" + twice + "' option is not allowed more than '1' time(s)."));
+    }
+    if (parsed.operands.len() == 0) {
+        return Err(usage_error("Invalid syntax."));
+    }
+    var has_t = false;
+    var has_r = false;
+    var has_q = false;
+    var has_f = false;
+    for (sw in parsed.switches) {
+        if (sw.name == "T") {
+            has_t = true;
+        } else if (sw.name == "R") {
+            has_r = true;
+        } else if (sw.name == "Q") {
+            has_q = true;
+        } else if (sw.name == "F") {
+            has_f = true;
+        }
+    }
+    if (has_t) {
+        return Err("ERROR: /T is not supported: Loup 1.26.0 cannot read file sizes and times.");
+    }
     return Ok(Options(
-        command = command,
-        operands = operands,
-        help = help,
-        version = version,
-        verbose = verbose,
-        shout = shout,
-        greeting = greeting,
+        help = false,
+        version = false,
+        recurse = has_r,
+        root = switch_value(parsed, "R") ?? "",
+        quiet = has_q,
+        quote = has_f,
+        patterns = parsed.operands,
     ));
 }

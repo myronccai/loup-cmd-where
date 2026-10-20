@@ -1,64 +1,56 @@
 @mode(host.dual)
 
 from debug.assert import (expect, expectEq);
-from cli.args import (parse_args, DEFAULT_GREETING);
+from cli.args import (parse_args, where_switches, MSG_TYPE_HELP);
 
-func test_no_arguments(): void {
+func same(got: string, want: string, what: string): void {
+    expect(got == want, what + ": got '" + got + "', want '" + want + "'");
+}
+
+func test_patterns_and_switches(): void {
+    let opts = parse_args(["/q", "ls", "-F", "*.sh"]).unwrap();
+    expect(opts.quiet and opts.quote and !opts.recurse, "/q -F");
+    same(opts.patterns.join(","), "ls,*.sh", "patterns");
+}
+
+func test_declared_switches(): void {
+    expectEq(where_switches().len(), 4, "R Q F T");
+}
+
+func test_recursive_dir(): void {
+    let opts = parse_args(["/R", "src", "*.c"]).unwrap();
+    expect(opts.recurse, "/R");
+    same(opts.root, "src", "directory");
+    same(opts.patterns.join(","), "*.c", "pattern");
+    same(parse_args(["/r:/tmp", "x"]).unwrap().root, "/tmp", "/r:dir");
+}
+
+func test_path_pattern_is_not_an_option(): void {
+    same(parse_args(["/usr/bin:ls"]).unwrap().patterns[0], "/usr/bin:ls", "path:pattern");
+}
+
+func test_errors(): void {
+    same(parse_args(["/x"]).unwrap_err(),
+        "ERROR: Invalid argument/option - '/x'.\n" + MSG_TYPE_HELP, "unknown option");
+    same(parse_args(["/R"]).unwrap_err(),
+        "ERROR: Invalid syntax. Value expected for '/R'.\n" + MSG_TYPE_HELP, "no /R value");
+    same(parse_args(["/Q", "-q", "x"]).unwrap_err(),
+        "ERROR: Invalid syntax. '-q' option is not allowed more than '1' time(s).\n" + MSG_TYPE_HELP,
+        "repeated");
     let none: list[string] = [];
-    let opts = parse_args(none).unwrap();
-    expectEq(opts.command, "", "no command");
-    expectEq(opts.operands.len(), 0, "no operands");
-    expectEq(opts.greeting, DEFAULT_GREETING, "default greeting");
-    expect(!opts.help and !opts.version and !opts.verbose and !opts.shout, "no flags set");
+    same(parse_args(none).unwrap_err(), "ERROR: Invalid syntax.\n" + MSG_TYPE_HELP, "no pattern");
+    expect(parse_args(["/T", "x"]).unwrap_err().startsWith("ERROR: /T is not supported"), "/T");
 }
 
-func test_command_and_operands(): void {
-    let opts = parse_args(["hello", "Ann"]).unwrap();
-    expectEq(opts.command, "hello", "command");
-    expectEq(opts.operands.len(), 1, "one operand");
-    expectEq(opts.operands[0], "Ann", "operand");
-}
-
-func test_flags_anywhere(): void {
-    let opts = parse_args(["-v", "hello", "--shout", "Ann"]).unwrap();
-    expect(opts.verbose, "verbose");
-    expect(opts.shout, "shout");
-    expectEq(opts.command, "hello", "command");
-    expectEq(opts.operands[0], "Ann", "operand");
+func test_double_dash(): void {
+    let opts = parse_args(["--", "-x", "/?"]).unwrap();
+    expect(!opts.help, "/? after --");
+    same(opts.patterns.join(","), "-x,/?", "patterns after --");
 }
 
 func test_help_and_version(): void {
+    expect(parse_args(["/?"]).unwrap().help, "/?");
+    expect(parse_args(["/x", "-?"]).unwrap().help, "-? wins");
     expect(parse_args(["--help"]).unwrap().help, "--help");
-    expect(parse_args(["-h"]).unwrap().help, "-h");
     expect(parse_args(["--version"]).unwrap().version, "--version");
-    expect(parse_args(["-V"]).unwrap().version, "-V");
-}
-
-func test_value_option_forms(): void {
-    expectEq(parse_args(["-g", "Hi"]).unwrap().greeting, "Hi", "-g VALUE");
-    expectEq(parse_args(["--greeting", "Hi"]).unwrap().greeting, "Hi", "--greeting VALUE");
-    expectEq(parse_args(["--greeting=a=b"]).unwrap().greeting, "a=b", "--greeting=VALUE keeps '='");
-}
-
-func test_double_dash_ends_options(): void {
-    let opts = parse_args(["hello", "--", "--shout"]).unwrap();
-    expect(!opts.shout, "--shout after -- is an operand");
-    expectEq(opts.operands[0], "--shout", "operand");
-}
-
-func test_lone_dash_is_operand(): void {
-    let opts = parse_args(["hello", "-"]).unwrap();
-    expectEq(opts.operands[0], "-", "operand");
-}
-
-func test_unknown_option(): void {
-    expectEq(parse_args(["--nope"]).unwrap_err(), "unknown option '--nope'", "error message");
-}
-
-func test_missing_value(): void {
-    expectEq(parse_args(["-g"]).unwrap_err(), "option '-g' requires a value", "error message");
-}
-
-func test_flag_with_value(): void {
-    expectEq(parse_args(["--shout=1"]).unwrap_err(), "option '--shout' does not take a value", "error message");
 }

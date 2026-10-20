@@ -1,0 +1,111 @@
+@mode(host.dual)
+
+from debug.assert import (expect, expectEq);
+from io.fs import (createDir, writeText, removeDir, isDir);
+from commands.wherefile import (parse_query, valid_pattern, split_dir_list, resolve_dir,
+    extensions, literal_prefix, literal_suffix, search_dir, search_dirs, search_tree,
+    default_dirs, format_path, msg_env_not_found, SEARCH_DEFAULT, SEARCH_ENV, SEARCH_PATHS);
+
+func same(got: string, want: string, what: string): void {
+    expect(got == want, what + ": got '" + got + "', want '" + want + "'");
+}
+
+func test_parse_query(): void {
+    let plain = parse_query("ls*");
+    expectEq(plain.kind, SEARCH_DEFAULT, "plain");
+    same(plain.pattern, "ls*", "plain pattern");
+    let byenv = parse_query("$PATH:*.sh");
+    expectEq(byenv.kind, SEARCH_ENV, "env");
+    same(byenv.source, "PATH", "variable");
+    same(byenv.pattern, "*.sh", "env pattern");
+    let bypaths = parse_query("/usr/bin;/bin:l?");
+    expectEq(bypaths.kind, SEARCH_PATHS, "paths");
+    same(bypaths.source, "/usr/bin;/bin", "the last colon splits");
+    same(bypaths.pattern, "l?", "paths pattern");
+}
+
+func test_valid_pattern(): void {
+    expect(valid_pattern("*.txt"), "file pattern");
+    expect(!valid_pattern(""), "empty");
+    expect(!valid_pattern("sub/x"), "slash");
+    expect(!valid_pattern("sub\\x"), "backslash");
+}
+
+func test_split_dir_list(): void {
+    same(split_dir_list("/a:/b;\"/c d\";;/e").join("|"), "/a|/b|/c d|/e", "both separators, quotes");
+    expectEq(split_dir_list("").len(), 0, "empty");
+}
+
+func test_resolve_dir(): void {
+    same(resolve_dir("/home/u", "/usr/bin/"), "/usr/bin", "absolute");
+    same(resolve_dir("/home/u", "bin"), "/home/u/bin", "relative");
+    same(resolve_dir("/home/u", "..\\x"), "/home/x", "backslash and ..");
+}
+
+func test_extensions(): void {
+    same(extensions("").join("|"), "", "none");
+    expectEq(extensions("").len(), 1, "only the pattern itself");
+    same(extensions(".COM;.EXE;;.BAT").join("|"), "|.COM|.EXE|.BAT", "PATHEXT");
+}
+
+func test_literal_prefix_and_suffix(): void {
+    same(literal_prefix("LS*"), "LS", "prefix before *");
+    same(literal_prefix("A.*"), "A", "a dot before a wildcard may match nothing");
+    same(literal_prefix("*.TXT"), "", "no prefix");
+    same(literal_prefix("NAME"), "NAME", "no wildcard");
+    same(literal_suffix("*.TXT"), ".TXT", "suffix");
+    same(literal_suffix("A?C"), "C", "after ?");
+    same(literal_suffix("*."), "", "a final dot may match nothing");
+}
+
+func test_format_path(): void {
+    same(format_path("/usr/bin/ls", false), "\\usr\\bin\\ls", "backslashes");
+    same(format_path("/usr/bin/ls", true), "\"\\usr\\bin\\ls\"", "/F quotes");
+    same(msg_env_not_found("X"), "ERROR: Environment variable \"X\" is not found.", "env message");
+}
+
+func test_default_dirs(): void {
+    same(default_dirs("/cwd", "/usr/bin:rel").join("|"), "/cwd|/usr/bin|/cwd/rel", "cwd first");
+}
+
+func fixture(): string {
+    let root = "build/tmp/where_search";
+    if (isDir(root)) {
+        removeDir(root);
+    }
+    createDir(root);
+    createDir(root + "/bin1");
+    createDir(root + "/bin2");
+    createDir(root + "/bin2/tool");
+    createDir(root + "/bin2/deep");
+    writeText(root + "/bin1/tool", "");
+    writeText(root + "/bin1/Tool.BAT", "");
+    writeText(root + "/bin1/tool.exe", "");
+    writeText(root + "/bin1/toolbox", "");
+    writeText(root + "/bin2/TOOL.exe", "");
+    writeText(root + "/bin2/deep/tool", "");
+    return root;
+}
+
+func test_search_dir(): void {
+    let root = fixture();
+    let d = root + "/bin1";
+    same(search_dir(d, "tool", [""]).join("|"), d + "/tool", "exact name");
+    same(search_dir(d, "TOOL", [""]).join("|"), d + "/tool", "case-insensitive");
+    same(search_dir(d, "tool", ["", ".EXE", ".BAT"]).join("|"),
+        d + "/tool|" + d + "/tool.exe|" + d + "/Tool.BAT", "extensions in PATHEXT order");
+    same(search_dir(d, "tool*", [""]).join("|"),
+        d + "/tool|" + d + "/Tool.BAT|" + d + "/tool.exe|" + d + "/toolbox", "wildcard, sorted");
+    expectEq(search_dir(root + "/bin2", "tool", [""]).len(), 0, "a directory is not a file");
+    expectEq(search_dir(root + "/none", "tool", [""]).len(), 0, "missing directory");
+    removeDir(root);
+}
+
+func test_search_dirs_and_tree(): void {
+    let root = fixture();
+    same(search_dirs([root + "/bin2", root + "/bin1"], "tool.exe", [""]).join("|"),
+        root + "/bin2/TOOL.exe|" + root + "/bin1/tool.exe", "directory order");
+    same(search_tree(root, "tool", [""]).join("|"),
+        root + "/bin1/tool|" + root + "/bin2/deep/tool", "tree in /S order");
+    removeDir(root);
+}

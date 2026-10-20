@@ -1,28 +1,30 @@
 @mode(host.dual)
 
-from appinfo import (APP_NAME, APP_VERSION, APP_SUMMARY);
-from cli.args import (DEFAULT_GREETING);
+from appinfo import (APP_NAME, APP_VERSION);
 
+# The text of `where /?`: a short summary of the syntax and switches (in
+# this project's own words).
 pub func usage(): string {
     let lines = [
-        i"usage: {$ APP_NAME $} [OPTIONS] COMMAND [ARGS...]",
+        "WHERE [/R dir] [/Q] [/F] [/T] pattern...",
         "",
-        APP_SUMMARY,
+        "Shows the full path of every file that matches a pattern. Without /R it",
+        "looks in the current directory, then in each directory of PATH.",
         "",
-        "Commands:",
-        "  hello [NAME]          Print a greeting (NAME defaults to 'world')",
-        "  help                  Show this help",
+        "  /R dir    Search dir and every directory below it instead.",
+        "  /Q        Quiet: print nothing, only set the ERRORLEVEL.",
+        "  /F        Put each path in double quotes.",
+        "  /T        Sizes and times (not supported by this version).",
+        "  pattern   A file name; * and ? are wildcards. $VAR:pattern searches",
+        "            the directories listed in environment variable VAR, and",
+        "            dir1;dir2:pattern the directories given. Each extension",
+        "            in PATHEXT is also tried after the pattern.",
         "",
-        "Options:",
-        i"  -g, --greeting TEXT   Greeting used by 'hello' (default: {$ DEFAULT_GREETING $})",
-        "      --shout           Print the greeting in upper case",
-        "  -v, --verbose         Print diagnostic messages to stderr",
-        "  -h, --help            Show this help and exit",
-        "  -V, --version         Show the version and exit",
+        "ERRORLEVEL: 0 found, 1 nothing found, 2 error.",
     ];
     return lines.join("\n");
 }
 
 pub func version_line(): string {
-    return i"{$ APP_NAME $} {$ APP_VERSION $}";
+    return i"{$ APP_NAME $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
 }

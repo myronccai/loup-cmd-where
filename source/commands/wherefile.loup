@@ -1,0 +1,409 @@
+@mode(host.dual)
+
+# where: finds files by name pattern and prints their full paths, as the
+# Windows where command does. A pattern is searched
+#
+# - by default in the current directory, then in each directory of PATH;
+# - with `$ENV:pattern`, in the directories listed in variable ENV;
+# - with `dir1;dir2:pattern`, in the directories listed before the last `:`;
+# - with `/R dir`, in dir and every directory below it.
+#
+# In each directory the pattern is tried as given, then with each extension
+# of PATHEXT appended (`tool` also finds `tool.EXE`). Wildcards follow the
+# Win32 rules and ignore case. A file is printed once, however many
+# patterns or directories find it.
+#
+# (The module is not called `where`: that is a reserved word in Loup.)
+
+from appinfo import (EXIT_FOUND, EXIT_NOT_FOUND, EXIT_ERROR);
+from cli.args import (Options);
+from io.fs import (exists, isDir, isFile, listDir);
+from io.path import (normalize);
+from win.messages import (MSG_INVALID_NAME);
+from win.paths import (display_path, fs_path, is_absolute_path, join_path);
+from win.wildcard import (MAX_DEPTH, has_wildcards, sort_names, subdirectories, wild_match);
+
+pub const MSG_NOT_FOUND: string = "INFO: Could not find files for the given pattern(s).";
+pub const MSG_ENV_WITH_R: string = "ERROR: \"$env:pattern\" cannot be used with /R.";
+pub const MSG_PATH_WITH_R: string = "ERROR: \"path:pattern\" format cannot be used with /R.";
+pub const MSG_BAD_PATTERN: string = "ERROR: Invalid pattern is specified in \"path:pattern\" search format.";
+pub const MSG_NO_SUCH_FILE: string = "ERROR: The system cannot find the file specified.";
+pub const MSG_BAD_DIR: string = "ERROR: Invalid directory is specified.";
+
+pub func msg_env_not_found(name: string): string {
+    return "ERROR: Environment variable \"" + name + "\" is not found.";
+}
+
+# Where a pattern is searched.
+pub const SEARCH_DEFAULT: int = 0;  # current directory, then PATH
+pub const SEARCH_ENV: int = 1;      # $ENV:pattern
+pub const SEARCH_PATHS: int = 2;    # dir1;dir2:pattern
+
+# One pattern operand, taken apart.
+pub struct Query {
+    pub kind: int;        # SEARCH_DEFAULT, SEARCH_ENV or SEARCH_PATHS
+    pub source: string;   # the variable name, or the directory list
+    pub pattern: string;  # the file name pattern
+}
+
+func make_query(kind: int, source: string, pattern: string): Query {
+    return Query(kind = kind, source = source, pattern = pattern);
+}
+
+# Splits an operand at its last `:` into the search source and the pattern.
+pub func parse_query(operand: string): Query {
+    var colon = -1;
+    var i = 0;
+    for (ch in operand) {
+        if (ch == ":") {
+            colon = i;
+        }
+        i += 1;
+    }
+    if (colon < 0) {
+        return make_query(SEARCH_DEFAULT, "", operand);
+    }
+    let before = operand.slice(0, colon);
+    let after = operand.slice(colon + 1);
+    if (before.startsWith("$")) {
+        return make_query(SEARCH_ENV, before.slice(1), after);
+    }
+    return make_query(SEARCH_PATHS, before, after);
+}
+
+# Whether a pattern can be searched: a file name, without a directory.
+pub func valid_pattern(pattern: string): bool {
+    return pattern.len() > 0 and pattern.index_of("/") < 0 and pattern.index_of("\\") < 0;
+}
+
+# The directories of a list such as PATH. Windows separates them with `;`,
+# Linux with `:`; both are accepted. Quotes around an entry are removed and
+# empty entries skipped.
+pub func split_dir_list(text: string): list[string] {
+    var out: list[string] = [];
+    for (part in text.replace(";", ":").split(":")) {
+        let dir = part.replace("\"", "").trim();
+        if (dir.len() > 0) {
+            out.push(dir);
+        }
+    }
+    return out;
+}
+
+# A directory in fs form, made absolute against `cwd` and normalized.
+pub func resolve_dir(cwd: string, dir: string): string {
+    let p = fs_path(dir);
+    if (is_absolute_path(p)) {
+        return normalize(p);
+    }
+    return normalize(cwd + "/" + p);
+}
+
+# The suffixes each pattern is tried with: none first, then each PATHEXT
+# extension in order (`.COM;.EXE` → ["", ".COM", ".EXE"]).
+pub func extensions(pathext: string): list[string] {
+    var out: list[string] = [""];
+    for (ext in pathext.split(";")) {
+        let e = ext.trim();
+        if (e.len() > 0) {
+            out.push(e);
+        }
+    }
+    return out;
+}
+
+# The literal text a matching name must start with: the pattern up to its
+# first wildcard, without a `.` just before it (`a.*` also matches `a`).
+pub func literal_prefix(pattern: string): string {
+    var end = 0;
+    for (ch in pattern) {
+        if (ch == "*" or ch == "?") {
+            break;
+        }
+        end += 1;
+    }
+    var prefix = pattern.slice(0, end);
+    if (end < pattern.len() and prefix.endsWith(".")) {
+        prefix = prefix.slice(0, prefix.len() - 1);
+    }
+    return prefix;
+}
+
+# The literal text a matching name must end with: the pattern after its last
+# wildcard, unless the pattern ends with `.` (which may match nothing).
+pub func literal_suffix(pattern: string): string {
+    if (pattern.endsWith(".")) {
+        return "";
+    }
+    var start = 0;
+    var i = 0;
+    for (ch in pattern) {
+        i += 1;
+        if (ch == "*" or ch == "?") {
+            start = i;
+        }
+    }
+    return pattern.slice(start);
+}
+
+# Whether a name matches a pattern under the Win32 rules. `upper_*` are the
+# upper-case forms. Cheap literal checks run first, so the full matcher
+# (which allocates) only sees likely candidates: native builds of Loup
+# 1.26.0 never free those allocations.
+func name_matches(pattern: string, upper_pattern: string, prefix: string, suffix: string,
+    name: string, upper_name: string): bool {
+    if (!has_wildcards(pattern) and !pattern.endsWith(".")) {
+        return upper_pattern == upper_name;
+    }
+    if (pattern == "*" or pattern == "*.*") {
+        return true;
+    }
+    if (upper_name.len() < prefix.len() + suffix.len()) {
+        return false;
+    }
+    if (!upper_name.startsWith(prefix) or !upper_name.endsWith(suffix)) {
+        return false;
+    }
+    return wild_match(pattern, name);
+}
+
+# The files in one directory matching the pattern with each extension, in
+# that order, each sorted by name (fs-form paths).
+pub func search_dir(dir: string, pattern: string, exts: list[string]): list[string] {
+    var out: list[string] = [];
+    if (!isDir(dir)) {
+        return out;
+    }
+    let names = listDir(dir);
+    var upper: list[string] = [];
+    for (name in names) {
+        upper.push(name.toUpperCase());
+    }
+    for (ext in exts) {
+        let pat = pattern + ext;
+        let upper_pat = pat.toUpperCase();
+        let prefix = literal_prefix(upper_pat);
+        let suffix = literal_suffix(upper_pat);
+        var hits: list[string] = [];
+        for (k in 0..names.len()) {
+            if (name_matches(pat, upper_pat, prefix, suffix, names[k], upper[k])) {
+                hits.push(names[k]);
+            }
+        }
+        for (name in sort_names(hits)) {
+            let path = join_path(dir, name);
+            if (isFile(path) and !out.contains(path)) {
+                out.push(path);
+            }
+        }
+    }
+    return out;
+}
+
+# The matches in several directories, in order.
+pub func search_dirs(dirs: list[string], pattern: string, exts: list[string]): list[string] {
+    var out: list[string] = [];
+    for (dir in dirs) {
+        for (path in search_dir(dir, pattern, exts)) {
+            out.push(path);
+        }
+    }
+    return out;
+}
+
+# The symbolic links at or under `root` (fs-form paths, as `find` prints
+# them). Loup 1.26.0 has no lstat(), and following links to directories can
+# loop, so the tree walk asks find once and does not descend into them.
+pub func symlinks_under(root: string): dict[string, bool] {
+    var links: dict[string, bool] = {};
+    let text = tool_output("find", ["-H", root, "-type", "l"]);
+    for (line in text.split("\n")) {
+        if (line.len() > 0) {
+            links[line] = true;
+        }
+    }
+    return links;
+}
+
+# `root` and every directory below it in `/S` order (a directory, then each
+# subdirectory, sorted, depth first), skipping symbolic links to
+# directories and stopping at MAX_DEPTH levels.
+pub func walk_tree(root: string, links: dict[string, bool]): list[string] {
+    var out: list[string] = [];
+    var stack: list[string] = [root];
+    var depths: list[int] = [0];
+    while (stack.len() > 0) {
+        let current = stack.pop();
+        let depth = depths.pop();
+        out.push(current);
+        if (depth < MAX_DEPTH) {
+            let subs = subdirectories(current);
+            var i = subs.len() - 1;
+            while (i >= 0) {
+                let child = join_path(current, subs[i]);
+                if (!links.containsKey(child)) {
+                    stack.push(child);
+                    depths.push(depth + 1);
+                }
+                i -= 1;
+            }
+        }
+    }
+    return out;
+}
+
+# The matches in `root` and every directory below it, in `/S` order: a
+# directory's own files, then each subdirectory (sorted), depth first.
+pub func search_tree(root: string, pattern: string, exts: list[string]): list[string] {
+    return search_dirs(walk_tree(root, symlinks_under(root)), pattern, exts);
+}
+
+# The directories a default search looks in: the current directory, then
+# PATH's.
+pub func default_dirs(cwd: string, path_var: string): list[string] {
+    var out: list[string] = [cwd];
+    for (dir in split_dir_list(path_var)) {
+        out.push(resolve_dir(cwd, dir));
+    }
+    return out;
+}
+
+# A list of directories made absolute.
+pub func resolve_dirs(cwd: string, text: string): list[string] {
+    var out: list[string] = [];
+    for (dir in split_dir_list(text)) {
+        out.push(resolve_dir(cwd, dir));
+    }
+    return out;
+}
+
+# The value of an environment variable; Windows names ignore case, so an
+# upper-case name is tried too (`$path` finds PATH).
+func variable(name: string): Option[string] {
+    let exact = env(name) ?? "";
+    if (exact.len() > 0) {
+        return Some(exact);
+    }
+    let upper = env(name.toUpperCase()) ?? "";
+    if (upper.len() > 0) {
+        return Some(upper);
+    }
+    return None;
+}
+
+# The standard output of a system tool, or "" when it cannot be run. PATH
+# may not list the system directories (it is what where searches), so the
+# usual places are tried too. (The result of exec must be read in the
+# function that called it, natively.)
+func tool_output(name: string, args: list[string]): string {
+    for (prefix in ["", "/usr/bin/", "/bin/"]) {
+        var argv = [prefix + name];
+        for (a in args) {
+            argv.push(a);
+        }
+        let r = exec(argv);
+        if (r.exit_code != 127) {
+            return r.stdout.to_string();
+        }
+    }
+    return "";
+}
+
+# The current directory, as the shell shows it (symbolic links kept).
+# runtime.fs().cwd() does not build natively in Loup 1.26.0, so ask pwd.
+pub func current_dir(): string {
+    let shown = tool_output("pwd", ["-L"]).trim();
+    if (shown.len() > 0) {
+        return shown;
+    }
+    return env("PWD") ?? ".";
+}
+
+# A found file as where prints it: full path with `\`, in quotes for /F.
+pub func format_path(path: string, quote: bool): string {
+    let shown = display_path(path);
+    if (quote) {
+        return "\"" + shown + "\"";
+    }
+    return shown;
+}
+
+# Prints an error unless /Q asked for silence.
+func report(opts: Options, message: string): void {
+    if (!opts.quiet) {
+        printErr(message);
+    }
+}
+
+pub func run_where(opts: Options): int {
+    let cwd = current_dir();
+    let exts = extensions(env("PATHEXT") ?? "");
+
+    var root = "";
+    if (opts.recurse) {
+        let r = fs_path(opts.root);
+        if (opts.root.index_of(";") >= 0) {
+            report(opts, "ERROR: " + MSG_INVALID_NAME);
+            return EXIT_ERROR;
+        }
+        if (!exists(r)) {
+            report(opts, MSG_NO_SUCH_FILE);
+            return EXIT_ERROR;
+        }
+        if (!isDir(r)) {
+            report(opts, MSG_BAD_DIR);
+            return EXIT_ERROR;
+        }
+        root = resolve_dir(cwd, r);
+    }
+
+    var found: list[string] = [];
+    var failed = false;
+    for (operand in opts.patterns) {
+        let q = parse_query(operand);
+        if (opts.recurse and q.kind == SEARCH_ENV) {
+            report(opts, MSG_ENV_WITH_R);
+            return EXIT_ERROR;
+        }
+        if (opts.recurse and q.kind == SEARCH_PATHS) {
+            report(opts, MSG_PATH_WITH_R);
+            return EXIT_ERROR;
+        }
+        if (!valid_pattern(q.pattern)) {
+            report(opts, MSG_BAD_PATTERN);
+            return EXIT_ERROR;
+        }
+        var paths: list[string] = [];
+        if (opts.recurse) {
+            paths = search_tree(root, q.pattern, exts);
+        } else if (q.kind == SEARCH_ENV) {
+            let value = variable(q.source) ?? "";
+            if (value.len() == 0) {
+                report(opts, msg_env_not_found(q.source));
+                failed = true;
+                continue;
+            }
+            paths = search_dirs(resolve_dirs(cwd, value), q.pattern, exts);
+        } else if (q.kind == SEARCH_PATHS) {
+            paths = search_dirs(resolve_dirs(cwd, q.source), q.pattern, exts);
+        } else {
+            paths = search_dirs(default_dirs(cwd, env("PATH") ?? ""), q.pattern, exts);
+        }
+        for (path in paths) {
+            if (!found.contains(path)) {
+                found.push(path);
+                if (!opts.quiet) {
+                    println(format_path(path, opts.quote));
+                }
+            }
+        }
+    }
+    if (failed) {
+        return EXIT_ERROR;
+    }
+    if (found.len() == 0) {
+        report(opts, MSG_NOT_FOUND);
+        return EXIT_NOT_FOUND;
+    }
+    return EXIT_FOUND;
+}
