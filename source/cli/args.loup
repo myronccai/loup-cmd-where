@@ -8,6 +8,14 @@
 # Switches are case-insensitive and start with `/` or `-`; `--` ends switch
 # parsing. Error messages use the wording of where.exe's command-line
 # parser, followed by `Type "WHERE /?" for usage.`
+#
+# Runtime: host.dual. Compiled into the native binary build/where by `make
+# build`; `loup run source/main.loup` interprets the same code.
+#
+# Structure: parse_args parses the whole command line once for the switches
+# and patterns, then the part before `--` a second time: there, unlike in
+# the shared parser, an undeclared `/x` is an error rather than a pattern.
+# The checks for repeated switches, missing patterns and /T follow.
 
 from win.switches import (SwitchArgs, SwitchSpec, flag, required_value, parse_switches,
     switch_value);

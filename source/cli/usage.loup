@@ -1,5 +1,10 @@
 @mode(host.dual)
 
+# The help text of where (`where /?`) and its --version line.
+#
+# Runtime: host.dual. Compiled into the native binary build/where by `make
+# build`; `loup run source/main.loup` interprets the same code.
+
 from appinfo import (APP_NAME, APP_VERSION);
 
 # The text of `where /?`: a short summary of the syntax and switches (in
