@@ -106,6 +106,9 @@ func test_search_dir(): void {
         d + "/tool|" + d + "/tool.exe|" + d + "/Tool.BAT", "extensions in PATHEXT order");
     same(search_dir(d, "tool*", [""]).join("|"),
         d + "/tool|" + d + "/Tool.BAT|" + d + "/tool.exe|" + d + "/toolbox", "wildcard, sorted");
+    same(search_dir(d, "tool*", ["", ".EXE"]).join("|"),
+        d + "/tool|" + d + "/Tool.BAT|" + d + "/tool.exe|" + d + "/toolbox",
+        "a file two extensions find is listed once");
     expectEq(search_dir(root + "/bin2", "tool", [""]).len(), 0, "a directory is not a file");
     expectEq(search_dir(root + "/none", "tool", [""]).len(), 0, "missing directory");
     removeDir(root);
@@ -117,5 +120,16 @@ func test_search_dirs_and_tree(): void {
         root + "/bin2/TOOL.exe|" + root + "/bin1/tool.exe", "directory order");
     same(search_tree(root, "tool", [""]).join("|"),
         root + "/bin1/tool|" + root + "/bin2/deep/tool", "tree in /S order");
+    removeDir(root);
+}
+
+func test_tree_skips_directory_links(): void {
+    let root = fixture();
+    # A link back up the tree: following it would find bin2/deep/tool again
+    # at every level.
+    let made = exec(["ln", "-s", "..", root + "/bin2/deep/up"]);
+    expectEq(made.exit_code, 0, "ln -s");
+    same(search_tree(root + "/bin2", "tool", [""]).join("|"), root + "/bin2/deep/tool",
+        "the linked directory is not entered");
     removeDir(root);
 }

@@ -10,24 +10,24 @@ from appinfo import (APP_NAME, APP_VERSION);
 # The text of `where /?`: a short summary of the syntax and switches (in
 # this project's own words).
 pub func usage(): string {
-    let lines = [
-        "WHERE [/R dir] [/Q] [/F] [/T] pattern...",
-        "",
-        "Shows the full path of every file that matches a pattern. Without /R it",
-        "looks in the current directory, then in each directory of PATH.",
-        "",
-        "  /R dir    Search dir and every directory below it instead.",
-        "  /Q        Quiet: print nothing, only set the ERRORLEVEL.",
-        "  /F        Put each path in double quotes.",
-        "  /T        Sizes and times (not supported by this version).",
-        "  pattern   A file name; * and ? are wildcards. $VAR:pattern searches",
-        "            the directories listed in environment variable VAR, and",
-        "            dir1;dir2:pattern the directories given. Each extension",
-        "            in PATHEXT is also tried after the pattern.",
-        "",
-        "ERRORLEVEL: 0 found, 1 nothing found, 2 error.",
-    ];
-    return lines.join("\n");
+    let text = """
+    WHERE [/R dir] [/Q] [/F] [/T] pattern...
+
+    Shows the full path of every file that matches a pattern. Without /R it
+    looks in the current directory, then in each directory of PATH.
+
+      /R dir    Search dir and every directory below it instead.
+      /Q        Quiet: print nothing, only set the ERRORLEVEL.
+      /F        Put each path in double quotes.
+      /T        Sizes and times (not supported by this version).
+      pattern   A file name; * and ? are wildcards. $VAR:pattern searches
+                the directories listed in environment variable VAR, and
+                dir1;dir2:pattern the directories given. Each extension
+                in PATHEXT is also tried after the pattern.
+
+    ERRORLEVEL: 0 found, 1 nothing found, 2 error.
+    """;
+    return text;
 }
 
 pub func version_line(): string {

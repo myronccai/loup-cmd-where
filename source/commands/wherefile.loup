@@ -17,14 +17,15 @@
 #
 # Runtime: host.dual. Compiled into the native binary build/where by `make
 # build`; `loup run source/main.loup` interprets the same code. It runs
-# `find` and `pwd` through exec(), so it needs those tools at run time.
+# `pwd` (and, for /R, the shared walk runs `find`) through exec(), so it
+# needs those tools at run time.
 #
 # Structure: messages; taking a pattern operand apart (parse_query);
 # directory lists and PATHEXT; matching names in one directory
-# (search_dir); the /R tree walk (search_tree); the directories each kind
-# of search looks in; helpers that ask the system (tool_output,
-# current_dir); and run_where, which prints each file the first time it is
-# found.
+# (search_dir); the /R tree walk (search_tree, over the shared walk_dirs);
+# the directories each kind of search looks in; helpers that ask the
+# system (tool_output, current_dir); and run_where, which prints each file
+# the first time it is found (an OrderedSet remembers them).
 
 from appinfo import (EXIT_FOUND, EXIT_NOT_FOUND, EXIT_ERROR);
 from cli.args import (Options);
@@ -32,7 +33,8 @@ from io.fs import (exists, isDir, isFile, listDir);
 from io.path import (normalize);
 from win.messages import (MSG_INVALID_NAME);
 from win.paths import (display_path, fs_path, is_absolute_path, join_path);
-from win.wildcard import (MAX_DEPTH, has_wildcards, sort_names, subdirectories, wild_match);
+from win.wildcard import (has_wildcards, sort_names, walk_dirs, wild_match);
+from structures.ordered_set import (OrderedSet);
 
 pub const MSG_NOT_FOUND: string = "INFO: Could not find files for the given pattern(s).";
 pub const MSG_ENV_WITH_R: string = "ERROR: \"$env:pattern\" cannot be used with /R.";
@@ -184,12 +186,15 @@ func name_matches(pattern: string, upper_pattern: string, prefix: string, suffix
 }
 
 # The files in one directory matching the pattern with each extension, in
-# that order, each sorted by name (fs-form paths).
+# that order, each sorted by name (fs-form paths). A file that several
+# extensions find (`tool*` and `tool*.EXE`) is listed once, at its first
+# place.
 pub func search_dir(dir: string, pattern: string, exts: list[string]): list[string] {
     var out: list[string] = [];
     if (!isDir(dir)) {
         return out;
     }
+    let listed = OrderedSet();
     let names = listDir(dir);
     var upper: list[string] = [];
     for (name in names) {
@@ -208,7 +213,7 @@ pub func search_dir(dir: string, pattern: string, exts: list[string]): list[stri
         }
         for (name in sort_names(hits)) {
             let path = join_path(dir, name);
-            if (isFile(path) and !out.contains(path)) {
+            if (isFile(path) and listed.add(path)) {
                 out.push(path);
             }
         }
@@ -227,64 +232,19 @@ pub func search_dirs(dirs: list[string], pattern: string, exts: list[string]): l
     return out;
 }
 
-# /R: list every directory under the root once (walk_tree), then search
-# each of them like a PATH directory.
-
-# The symbolic links at or under `root` (fs-form paths, as `find` prints
-# them). Loup 1.26.0 has no lstat(), and following links to directories can
-# loop, so the tree walk asks find once and does not descend into them.
-pub func symlinks_under(root: string): dict[string, bool] {
-    var links: dict[string, bool] = {};
-    let text = tool_output("find", ["-H", root, "-type", "l"]);
-    for (line in text.split("\n")) {
-        if (line.len() > 0) {
-            links[line] = true;
-        }
-    }
-    return links;
-}
-
-# `root` and every directory below it in `/S` order (a directory, then each
-# subdirectory, sorted, depth first), skipping symbolic links to
-# directories and stopping at MAX_DEPTH levels.
-pub func walk_tree(root: string, links: dict[string, bool]): list[string] {
-    var out: list[string] = [];
-    var stack: list[string] = [root];
-    var depths: list[int] = [0];
-    while (stack.len() > 0) {
-        let current = stack.pop();
-        let depth = depths.pop();
-        out.push(current);
-        if (depth < MAX_DEPTH) {
-            let subs = subdirectories(current);
-            var i = subs.len() - 1;
-            while (i >= 0) {
-                let child = join_path(current, subs[i]);
-                if (!links.containsKey(child)) {
-                    stack.push(child);
-                    depths.push(depth + 1);
-                }
-                i -= 1;
-            }
-        }
-    }
-    return out;
-}
-
-# The matches in `root` and every directory below it, in `/S` order: a
-# directory's own files, then each subdirectory (sorted), depth first.
+# /R: the matches in `root` and every directory below it, in `/S` order:
+# a directory's own files, then each subdirectory (sorted), depth first.
+# The shared walk_dirs lists the directories once and does not enter
+# symbolic links to directories (they could loop: Loup 1.26.0 has no
+# lstat()); each is then searched like a PATH directory.
 pub func search_tree(root: string, pattern: string, exts: list[string]): list[string] {
-    return search_dirs(walk_tree(root, symlinks_under(root)), pattern, exts);
+    return search_dirs(walk_dirs(root), pattern, exts);
 }
 
 # The directories a default search looks in: the current directory, then
 # PATH's.
 pub func default_dirs(cwd: string, path_var: string): list[string] {
-    var out: list[string] = [cwd];
-    for (dir in split_dir_list(path_var)) {
-        out.push(resolve_dir(cwd, dir));
-    }
-    return out;
+    return [cwd] + resolve_dirs(cwd, path_var);
 }
 
 # A list of directories made absolute.
@@ -379,7 +339,7 @@ pub func run_where(opts: Options): int {
         root = resolve_dir(cwd, r);
     }
 
-    var found: list[string] = [];
+    let found = OrderedSet();
     var failed = false;
     for (operand in opts.patterns) {
         let q = parse_query(operand);
@@ -412,11 +372,8 @@ pub func run_where(opts: Options): int {
             paths = search_dirs(default_dirs(cwd, env("PATH") ?? ""), q.pattern, exts);
         }
         for (path in paths) {
-            if (!found.contains(path)) {
-                found.push(path);
-                if (!opts.quiet) {
-                    println(format_path(path, opts.quote));
-                }
+            if (found.add(path) and !opts.quiet) {
+                println(format_path(path, opts.quote));
             }
         }
     }
